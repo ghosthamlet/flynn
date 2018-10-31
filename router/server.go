@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -17,10 +19,17 @@ import (
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/router/schema"
 	"github.com/flynn/flynn/router/types"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
-var logger = log15.New("app", "router")
+var logger = log15.New()
+
+func init() {
+	if os.Getenv("DEBUG") == "" {
+		// filter debug log messages if DEBUG is not set
+		logger.SetHandler(log15.LvlFilterHandler(log15.LvlInfo, log15.StdoutHandler))
+	}
+}
 
 type Listener interface {
 	Start() error
@@ -92,6 +101,7 @@ func main() {
 		shutdown.Fatal("Missing random 32 byte base64-encoded COOKIE_KEY")
 	}
 	proxyProtocol := os.Getenv("PROXY_PROTOCOL") == "true"
+	legacyTLS := os.Getenv("LEGACY_TLS") == "true"
 
 	httpPort := flag.Int("http-port", 8080, "default http listen port")
 	httpsPort := flag.Int("https-port", 4433, "default https listen port")
@@ -105,7 +115,6 @@ func main() {
 
 	httpPorts := []int{*httpPort}
 	httpsPorts := []int{*httpsPort}
-	defaultPorts := []int{}
 	if portRaw := os.Getenv("DEFAULT_HTTP_PORT"); portRaw != "" {
 		if port, err := strconv.Atoi(portRaw); err != nil {
 			shutdown.Fatalf("Invalid DEFAULT_HTTP_PORTS: %s", err)
@@ -125,7 +134,7 @@ func main() {
 			httpsPorts[0] = port
 		}
 	}
-	defaultPorts = append(httpPorts, httpsPorts...)
+	defaultPorts := append(httpPorts, httpsPorts...)
 	if added := os.Getenv("ADDITIONAL_HTTP_PORTS"); added != "" {
 		for _, raw := range strings.Split(added, ",") {
 			if port, err := strconv.Atoi(raw); err == nil {
@@ -167,6 +176,29 @@ func main() {
 		}
 	}
 
+	var error503Page []byte
+	if error503PageURL := os.Getenv("ERROR_503_PAGE_URL"); error503PageURL != "" {
+		func() {
+			res, err := http.Get(error503PageURL)
+			if err != nil {
+				log.Error("error getting ERROR_503_PAGE_URL", "err", err)
+				return
+			}
+			defer res.Body.Close()
+			if res.StatusCode != 200 {
+				log.Error("unexpected status code getting ERROR_503_PAGE_URL", "status", res.StatusCode)
+				return
+			}
+			error503Page, err = ioutil.ReadAll(&io.LimitedReader{R: res.Body, N: 1000000})
+			if err != nil {
+				log.Error("error reading ERROR_503_PAGE_URL", "err", err)
+				return
+			}
+			return
+
+		}()
+	}
+
 	log.Info("connecting to postgres")
 	db := postgres.Wait(nil, nil)
 
@@ -202,14 +234,16 @@ func main() {
 			reservedPorts: reservedPorts,
 		},
 		HTTP: &HTTPListener{
-			Addrs:         httpAddrs,
-			TLSAddrs:      httpsAddrs,
-			defaultPorts:  defaultPorts,
-			cookieKey:     cookieKey,
-			keypair:       keypair,
-			ds:            NewPostgresDataStore("http", db.ConnPool),
-			discoverd:     discoverd.DefaultClient,
-			proxyProtocol: proxyProtocol,
+			Addrs:             httpAddrs,
+			TLSAddrs:          httpsAddrs,
+			LegacyTLSVersions: legacyTLS,
+			defaultPorts:      defaultPorts,
+			cookieKey:         cookieKey,
+			keypair:           keypair,
+			ds:                NewPostgresDataStore("http", db.ConnPool),
+			discoverd:         discoverd.DefaultClient,
+			proxyProtocol:     proxyProtocol,
+			error503Page:      error503Page,
 		},
 	}
 

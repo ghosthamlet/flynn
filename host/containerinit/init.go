@@ -39,8 +39,8 @@ import (
 	hh "github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/rpcplus"
 	"github.com/flynn/flynn/pkg/rpcplus/fdrpc"
+	"github.com/inconshreveable/log15"
 	"github.com/kr/pty"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 var logger log15.Logger
@@ -51,6 +51,7 @@ type Config struct {
 	Gateway   string
 	Hostname  string
 	WorkDir   string
+	MAC       string
 	IP        string
 	TTY       bool
 	OpenStdin bool
@@ -510,6 +511,7 @@ func babySit(init *ContainerInit, hbs []discoverd.Heartbeater) int {
 				continue
 			}
 			if sig == syscall.SIGTERM || sig == syscall.SIGINT {
+				log.Info("deregistering service due to signal")
 				shutdownOnce.Do(closeHBs)
 			}
 			log.Info("forwarding signal to job", "type", sig)

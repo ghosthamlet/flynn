@@ -13,7 +13,7 @@ import (
 	"github.com/flynn/flynn/pkg/shutdown"
 	sd "github.com/flynn/flynn/pkg/sirenia/discoverd"
 	"github.com/flynn/flynn/pkg/sirenia/state"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 func main() {
@@ -64,9 +64,10 @@ func main() {
 		ID:           id,
 		Singleton:    singleton,
 		DataDir:      filepath.Join(dataDir, "db"),
-		BinDir:       "/usr/lib/postgresql/9.5/bin/",
+		BinDir:       "/usr/lib/postgresql/10/bin/",
 		Password:     password,
 		Logger:       log.New("component", "postgres"),
+		TimescaleDB:  true,
 		ExtWhitelist: true,
 		WaitUpstream: true,
 		SHMType:      "posix",

@@ -42,13 +42,14 @@ import (
 	"github.com/flynn/flynn/pkg/syslog/rfc5424"
 	"github.com/flynn/flynn/pkg/verify"
 	"github.com/golang/groupcache/singleflight"
+	"github.com/inconshreveable/log15"
+	dhcp "github.com/krolaw/dhcp4"
 	"github.com/miekg/dns"
 	"github.com/opencontainers/runc/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/rancher/sparse-tools/sparse"
 	"github.com/vishvananda/netlink"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -68,6 +69,7 @@ type LibcontainerConfig struct {
 	LogMux           *logmux.Mux
 	PartitionCGroups map[string]int64
 	Logger           log15.Logger
+	EnableDHCP       bool
 }
 
 func NewLibcontainerBackend(config *LibcontainerConfig) (Backend, error) {
@@ -150,6 +152,8 @@ type Container struct {
 	RootPath  string         `json:"root_path"`
 	TmpPath   string         `json:"tmp_path"`
 	IP        net.IP         `json:"ip"`
+	MAC       string         `json:"mac"`
+	Hostname  string         `json:"hostname"`
 	MuxConfig *logmux.Config `json:"mux_config"`
 
 	container libcontainer.Container
@@ -297,14 +301,84 @@ func (l *LibcontainerBackend) ConfigureNetworking(config *host.NetworkConfig) er
 	defer l.containersMtx.Unlock()
 	for _, container := range l.containers {
 		if !container.job.Config.HostNetwork {
+			b := random.Bytes(5)
+			container.MAC = fmt.Sprintf("fe:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4])
 			if _, err := l.ipalloc.RequestIP(l.bridgeNet, container.IP); err != nil {
 				log.Error("error requesting ip", "job.id", container.job.ID, "err", err)
 			}
 		}
 	}
 
+	if l.EnableDHCP {
+		go func() {
+			if err := dhcp.ListenAndServeIf(l.BridgeName, l); err != nil {
+				shutdown.Fatal(err)
+			}
+		}()
+	}
+
 	close(l.networkConfigured)
 
+	return nil
+}
+
+func (l *LibcontainerBackend) ServeDHCP(p dhcp.Packet, msgType dhcp.MessageType, options dhcp.Options) (d dhcp.Packet) {
+	log := l.Logger.New("fn", "ServeDHCP")
+	replyOptions := dhcp.Options{
+		dhcp.OptionSubnetMask:       l.bridgeNet.Mask,
+		dhcp.OptionRouter:           l.bridgeAddr.To4(),
+		dhcp.OptionDomainNameServer: l.bridgeAddr.To4(),
+	}
+	switch msgType {
+	case dhcp.Discover:
+		log.Info("dhcp discover", "mac", p.CHAddr(), "options", options)
+		l.containersMtx.RLock()
+		defer l.containersMtx.RUnlock()
+		for _, container := range l.containers {
+			if container.MAC == p.CHAddr().String() {
+				log.Info("dhcp offer", "mac", p.CHAddr(), "container.id", container.ID, "container.ip", container.IP)
+				replyOptions[dhcp.OptionHostName] = []byte(container.Hostname)
+				return dhcp.ReplyPacket(
+					p,
+					dhcp.Offer,
+					l.bridgeAddr.To4(),
+					container.IP,
+					time.Hour,
+					replyOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]),
+				)
+			}
+		}
+	case dhcp.Request:
+		if server, ok := options[dhcp.OptionServerIdentifier]; ok && !net.IP(server).Equal(l.bridgeAddr) {
+			return nil // Message not for this dhcp server
+		}
+		reqIP := net.IP(options[dhcp.OptionRequestedIPAddress])
+		if reqIP == nil {
+			reqIP = net.IP(p.CIAddr())
+		}
+		log.Info("dhcp request", "mac", p.CHAddr(), "ip", reqIP)
+
+		if len(reqIP) == 4 && !reqIP.Equal(net.IPv4zero) {
+			l.containersMtx.RLock()
+			defer l.containersMtx.RUnlock()
+			for _, container := range l.containers {
+				if container.MAC == p.CHAddr().String() && container.IP.Equal(reqIP) {
+					log.Info("dhcp ack", "mac", p.CHAddr(), "container.id", container.ID, "container.ip", container.IP)
+					replyOptions[dhcp.OptionHostName] = []byte(container.Hostname)
+					return dhcp.ReplyPacket(
+						p,
+						dhcp.ACK,
+						l.bridgeAddr.To4(),
+						reqIP,
+						time.Hour,
+						replyOptions.SelectOrderOrAll(options[dhcp.OptionParameterRequestList]),
+					)
+				}
+			}
+		}
+		log.Info("dhcp nak", "mac", p.CHAddr())
+		return dhcp.ReplyPacket(p, dhcp.NAK, l.bridgeAddr, nil, 0, nil)
+	}
 	return nil
 }
 
@@ -339,9 +413,29 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		}
 	}()
 
+	// set defaults and apply job profiles
 	if job.Partition == "" {
 		job.Partition = defaultPartition
 	}
+	if job.Config.LinuxCapabilities == nil {
+		job.Config.LinuxCapabilities = &host.DefaultCapabilities
+	}
+	if job.Config.AllowedDevices == nil {
+		job.Config.AllowedDevices = &host.DefaultAllowedDevices
+	}
+	if job.Config.AutoCreatedDevices == nil {
+		job.Config.AutoCreatedDevices = &host.DefaultAutoCreatedDevices
+	}
+	for _, name := range job.Profiles {
+		profileFn, ok := jobProfiles[name]
+		if !ok {
+			return fmt.Errorf("unknown job profile: %s", name)
+		}
+		if err := profileFn(job); err != nil {
+			return fmt.Errorf("error applying %s profile: %s", name, err)
+		}
+	}
+
 	if _, ok := l.PartitionCGroups[job.Partition]; !ok {
 		return fmt.Errorf("host: invalid job partition %q", job.Partition)
 	}
@@ -377,12 +471,14 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		done: make(chan struct{}),
 	}
 	if !job.Config.HostNetwork {
+		b := random.Bytes(5)
+		container.MAC = fmt.Sprintf("fe:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4])
 		container.IP, err = l.ipalloc.RequestIP(l.bridgeNet, runConfig.IP)
 		if err != nil {
 			log.Error("error requesting ip", "err", err)
 			return err
 		}
-		log.Info("obtained ip", "network", l.bridgeNet.String(), "ip", container.IP.String())
+		log.Info("obtained ip", "network", l.bridgeNet.String(), "ip", container.IP.String(), "mac", container.MAC)
 		l.State.SetContainerIP(job.ID, container.IP)
 	}
 	defer func() {
@@ -414,12 +510,6 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		cgroupMountFlags |= syscall.MS_RDONLY
 	}
 
-	if job.Config.LinuxCapabilities == nil {
-		job.Config.LinuxCapabilities = &host.DefaultCapabilities
-	}
-	if job.Config.AllowedDevices == nil {
-		job.Config.AllowedDevices = &host.DefaultAllowedDevices
-	}
 	config := &configs.Config{
 		Rootfs:       rootPath,
 		Capabilities: *job.Config.LinuxCapabilities,
@@ -441,7 +531,7 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		ReadonlyPaths: []string{
 			"/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus",
 		},
-		Devices: configs.DefaultAutoCreatedDevices,
+		Devices: *job.Config.AutoCreatedDevices,
 		Mounts: append([]*configs.Mount{rootMount}, []*configs.Mount{
 			{
 				Source:      "proc",
@@ -517,6 +607,7 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 	if len(hostname) > 64 {
 		hostname = hostname[:64]
 	}
+	container.Hostname = hostname
 	if err := os.MkdirAll(filepath.Join(tmpPath, "etc"), 0755); err != nil {
 		log.Error("error creating container /etc", "err", err)
 		return err
@@ -584,7 +675,7 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		job.Config.Env[fmt.Sprintf("PORT_%d", i)] = strconv.Itoa(job.Config.Ports[i].Port)
 	}
 
-	if !job.Config.HostNetwork {
+	if container.IP != nil {
 		job.Config.Env["EXTERNAL_IP"] = container.IP.String()
 	}
 	// release the write lock, we won't mutate global structures from here on out
@@ -600,8 +691,9 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 		Resources: job.Resources,
 		LogLevel:  l.InitLogLevel,
 		Hostname:  hostname,
+		MAC:       container.MAC,
 	}
-	if !job.Config.HostNetwork {
+	if container.IP != nil {
 		initConfig.IP = container.IP.String() + "/24"
 		initConfig.Gateway = l.bridgeAddr.String()
 	}
@@ -651,6 +743,7 @@ func (l *LibcontainerBackend) Run(job *host.Job, runConfig *RunConfig, rateLimit
 				Type:              "veth",
 				Name:              "eth0",
 				Bridge:            l.BridgeName,
+				MacAddress:        initConfig.MAC,
 				Address:           initConfig.IP,
 				Gateway:           initConfig.Gateway,
 				Mtu:               1500,
@@ -796,7 +889,7 @@ func (l *LibcontainerBackend) mountSquashfs(m *host.Mountspec) (string, error) {
 			return "", fmt.Errorf("error getting squashfs layer from %s: %s", m.URL, err)
 		}
 
-		if _, err := tmp.Seek(0, os.SEEK_SET); err != nil {
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 			return "", fmt.Errorf("error seeking squashfs layer temp file: %s", err)
 		}
 		vol, err := l.VolManager.ImportFilesystem("default", &volume.Filesystem{
@@ -1062,7 +1155,7 @@ func (c *Container) cleanup() error {
 	delete(c.l.logStreams, c.job.ID)
 	c.l.logStreamMtx.Unlock()
 
-	if !c.job.Config.HostNetwork && c.l.bridgeNet != nil {
+	if c.IP != nil && c.l.bridgeNet != nil {
 		c.l.ipalloc.ReleaseIP(c.l.bridgeNet, c.IP)
 	}
 	for _, v := range c.job.Config.Volumes {

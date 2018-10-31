@@ -197,6 +197,9 @@ func runReleaseShow(args *docopt.Args, client controller.Client) error {
 	for k, v := range release.Env {
 		listRec(w, fmt.Sprintf("ENV[%s]", k), v)
 	}
+	for k, v := range release.Meta {
+		listRec(w, fmt.Sprintf("META[%s]", k), v)
+	}
 	return nil
 }
 
@@ -344,6 +347,9 @@ func runReleaseUpdate(args *docopt.Args, client controller.Client) error {
 			}
 			if len(procUpdate.AllowedDevices) > 0 {
 				procRelease.AllowedDevices = procUpdate.AllowedDevices
+			}
+			if len(procUpdate.Profiles) > 0 {
+				procRelease.Profiles = procUpdate.Profiles
 			}
 
 			release.Processes[procKey] = procRelease

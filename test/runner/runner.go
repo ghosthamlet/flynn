@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/subtle"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,34 +20,29 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/boltdb/bolt"
 	"github.com/flynn/flynn/pkg/attempt"
+	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/iotool"
+	"github.com/flynn/flynn/pkg/postgres"
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/shutdown"
 	"github.com/flynn/flynn/pkg/sse"
 	"github.com/flynn/flynn/pkg/stream"
-	"github.com/flynn/flynn/pkg/tlsconfig"
 	"github.com/flynn/flynn/pkg/typeconv"
 	"github.com/flynn/flynn/test/arg"
 	"github.com/flynn/flynn/test/buildlog"
 	"github.com/flynn/flynn/test/cluster"
 	"github.com/flynn/tail"
 	"github.com/julienschmidt/httprouter"
-	"github.com/thoj/go-ircevent"
-	"golang.org/x/crypto/acme/autocert"
 )
 
 var logBucket = "flynn-ci-logs"
-var dbBucket = []byte("builds")
-var listenPort string
 
 const textPlain = "text/plain; charset=utf-8"
 
@@ -65,27 +59,23 @@ const (
 )
 
 type Build struct {
-	ID                string        `json:"id"`
-	CreatedAt         *time.Time    `json:"created_at"`
-	Commit            string        `json:"commit"`
-	Branch            string        `json:"branch"`
-	Merge             bool          `json:"merge"`
-	State             string        `json:"state"`
-	Description       string        `json:"description"`
-	LogURL            string        `json:"log_url"`
-	LogFile           string        `json:"log_file"`
-	Duration          time.Duration `json:"duration"`
-	DurationFormatted string        `json:"duration_formatted"`
-	Reason            string        `json:"reason"`
-	IssueLink         string        `json:"issue_link"`
-	Version           BuildVersion  `json:"version"`
-	Failures          []string      `json:"failures"`
+	ID          string       `json:"id"`
+	CreatedAt   *time.Time   `json:"created_at"`
+	Commit      string       `json:"commit"`
+	Branch      string       `json:"branch"`
+	Merge       bool         `json:"merge"`
+	State       string       `json:"state"`
+	Description string       `json:"description"`
+	LogURL      string       `json:"log_url"`
+	LogFile     string       `json:"log_file"`
+	Duration    string       `json:"duration"`
+	Reason      string       `json:"reason"`
+	IssueLink   string       `json:"issue_link"`
+	Version     BuildVersion `json:"version"`
+	Failures    []string     `json:"failures"`
 }
 
 func (b *Build) URL() string {
-	if listenPort != "" && listenPort != "443" {
-		return "https://ci.flynn.io:" + listenPort + "/builds/" + b.ID
-	}
 	return "https://ci.flynn.io/builds/" + b.ID
 }
 
@@ -125,15 +115,12 @@ type Runner struct {
 	rootFS      string
 	githubToken string
 	s3          *s3.S3
-	networks    map[string]struct{}
-	netMtx      sync.Mutex
-	db          *bolt.DB
+	db          *postgres.DB
 	buildCh     chan struct{}
 	clusters    map[string]*cluster.Cluster
 	authKey     string
 	runEnv      map[string]string
-	subnet      uint64
-	ircMsgs     chan string
+	ip          string
 }
 
 var args *arg.Args
@@ -148,10 +135,8 @@ func main() {
 	runner := &Runner{
 		bc:       args.BootConfig,
 		events:   make(chan Event),
-		networks: make(map[string]struct{}),
 		buildCh:  make(chan struct{}, args.ConcurrentBuilds),
 		clusters: make(map[string]*cluster.Cluster),
-		ircMsgs:  make(chan string, 100),
 		runEnv:   make(map[string]string),
 	}
 	if err := runner.start(); err != nil {
@@ -180,41 +165,44 @@ func (r *Runner) start() error {
 		return errors.New("GITHUB_TOKEN not set")
 	}
 
-	am := autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		Cache:      autocert.DirCache(args.TLSDir),
-		HostPolicy: autocert.HostWhitelist(args.Domain),
+	// set r.ip from /.containerconfig
+	if err := func() error {
+		f, err := os.Open("/.containerconfig")
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		var config struct {
+			IP string
+		}
+		if err := json.NewDecoder(f).Decode(&config); err != nil {
+			return err
+		}
+		ip, _, err := net.ParseCIDR(config.IP)
+		if err != nil {
+			return err
+		}
+		r.ip = ip.String()
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	r.s3 = s3.New(session.New(&aws.Config{Region: aws.String("us-east-1")}))
 
 	var err error
-	_, listenPort, err = net.SplitHostPort(args.ListenAddr)
-	if err != nil {
-		return err
-	}
-
-	bc := r.bc
-	bc.Network = r.allocateNet()
-	if r.rootFS, err = cluster.BuildFlynn(bc, args.RootFS, "origin/master", false, os.Stdout); err != nil {
+	if r.rootFS, err = cluster.BuildFlynn(r.bc, args.RootFS, "origin/master", false, os.Stdout); err != nil {
 		return fmt.Errorf("could not build flynn: %s", err)
 	}
-	r.releaseNet(bc.Network)
 	shutdown.BeforeExit(func() { removeRootFS(r.rootFS) })
 
-	db, err := bolt.Open(args.DBPath, 0600, &bolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		return fmt.Errorf("could not open db: %s", err)
+	db := postgres.Wait(nil, nil)
+	if err := migrations.Migrate(db); err != nil {
+		return fmt.Errorf("error migrating db: %s", err)
 	}
-	r.db = db
+	db.Close()
+	r.db = postgres.Wait(nil, PrepareStatements)
 	shutdown.BeforeExit(func() { r.db.Close() })
-
-	if err := r.db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(dbBucket)
-		return err
-	}); err != nil {
-		return fmt.Errorf("could not create builds bucket: %s", err)
-	}
 
 	for i := 0; i < args.ConcurrentBuilds; i++ {
 		r.buildCh <- struct{}{}
@@ -224,7 +212,6 @@ func (r *Runner) start() error {
 		log.Printf("could not build pending builds: %s", err)
 	}
 
-	go r.connectIRC()
 	go r.watchEvents()
 
 	router := httprouter.New()
@@ -242,63 +229,13 @@ func (r *Runner) start() error {
 	router.POST("/cluster/:cluster/release", r.clusterAPI(r.addReleaseHosts))
 	router.DELETE("/cluster/:cluster/:host", r.clusterAPI(r.removeHost))
 
-	srv := &http.Server{
-		Addr:    args.ListenAddr,
-		Handler: router,
-		TLSConfig: tlsconfig.SecureCiphers(&tls.Config{
-			GetCertificate: am.GetCertificate,
-		}),
-	}
-	log.Println("Listening on", args.ListenAddr, "...")
-	if err := srv.ListenAndServeTLS("", ""); err != nil {
-		return fmt.Errorf("ListenAndServeTLS: %s", err)
+	listenAddr := ":" + os.Getenv("PORT")
+	log.Println("Listening on", listenAddr, "...")
+	if err := http.ListenAndServe(listenAddr, router); err != nil {
+		return fmt.Errorf("error running HTTP server: %s", err)
 	}
 
 	return nil
-}
-
-const (
-	ircServer = "irc.freenode.net:6697"
-	ircNick   = "flynn-ci"
-	ircRoom   = "#flynn"
-)
-
-func (r *Runner) connectIRC() {
-	conn := irc.IRC(ircNick, ircNick)
-	conn.UseTLS = true
-	conn.AddCallback("001", func(*irc.Event) {
-		conn.Join(ircRoom)
-	})
-	var once sync.Once
-	ready := make(chan struct{})
-	conn.AddCallback("JOIN", func(*irc.Event) {
-		once.Do(func() { close(ready) })
-	})
-	for {
-		log.Printf("connecting to IRC server: %s", ircServer)
-		err := conn.Connect(ircServer)
-		if err == nil {
-			break
-		}
-		log.Printf("error connecting to IRC server: %s", err)
-		time.Sleep(time.Second)
-	}
-	go conn.Loop()
-	<-ready
-	for msg := range r.ircMsgs {
-		conn.Notice(ircRoom, msg)
-	}
-}
-
-func (r *Runner) postIRC(format string, v ...interface{}) {
-	go func() {
-		// drop the message if the buffer is full because we are
-		// reconnecting
-		select {
-		case r.ircMsgs <- fmt.Sprintf(format, v...):
-		default:
-		}
-	}()
 }
 
 func (r *Runner) watchEvents() {
@@ -339,34 +276,35 @@ cd ~/go/src/github.com/flynn/flynn
 
 script/configure-docker "{{ .Cluster.ClusterDomain }}"
 
-build/bin/flynn cluster add \
-  --tls-pin "{{ .Config.TLSPin }}" \
-  --git-url "{{ .Config.GitURL }}" \
-  --docker-push-url "{{ .Config.DockerPushURL }}" \
-  default \
-  {{ .Config.ControllerURL }} \
-  {{ .Config.Key }}
+export DISCOVERD="http://{{ (index .Cluster.Instances 0).IP }}:1111"
 
-git config --global user.email "ci@flynn.io"
-git config --global user.name "CI"
-
-cd test
-
-cmd="bin/flynn-test \
-  --flynnrc $HOME/.flynnrc \
-  --cluster-api https://{{ .Cluster.BridgeIP }}:{{ .ListenPort }}/cluster/{{ .Cluster.ID }} \
-  --cli $(pwd)/../build/bin/flynn \
-  --flynn-host $(pwd)/../build/bin/flynn-host \
+# put the command in a file so the arguments aren't echoed in the logs
+cat > /tmp/run-tests.sh <<EOF
+build/bin/flynn-host run \
+  --host "{{ (index .Cluster.Instances 0).ID }}" \
+  --bind "$(pwd):/go/src/github.com/flynn/flynn,/var/run/docker.sock:/var/run/docker.sock,/var/lib/flynn:/var/lib/flynn,/mnt/backups:/mnt/backups" \
+  --volume "/tmp" \
+  "build/image/test.json" \
+  /usr/bin/env \
+  ROOT="/go/src/github.com/flynn/flynn" \
+  CLUSTER_ADD_ARGS="-p {{ .Config.TLSPin }} default {{ .Cluster.ClusterDomain }} {{ .Config.Key }}" \
+  ROUTER_IP="{{ .Cluster.RouterIP }}" \
+  DOMAIN="{{ .Cluster.ClusterDomain }}" \
+  TEST_RUNNER_AUTH_KEY="${TEST_RUNNER_AUTH_KEY}" \
+  BLOBSTORE_S3_CONFIG="${BLOBSTORE_S3_CONFIG}" \
+  BLOBSTORE_GCS_CONFIG="${BLOBSTORE_GCS_CONFIG}" \
+  BLOBSTORE_AZURE_CONFIG="${BLOBSTORE_AZURE_CONFIG}" \
+  /bin/run-flynn-test.sh \
+  --cluster-api http://{{ .RunnerIP }}/cluster/{{ .Cluster.ID }} \
   --router-ip {{ .Cluster.RouterIP }} \
   --backups-dir "/mnt/backups" \
-  --debug"
+  --debug
+EOF
+chmod +x /tmp/run-tests.sh
 
-timeout --signal=QUIT --kill-after=10 45m $cmd
+timeout --signal=QUIT --kill-after=10 45m /tmp/run-tests.sh
+
 `[1:]))
-
-func formatDuration(d time.Duration) string {
-	return fmt.Sprintf("%dm%02ds", d/time.Minute, d%time.Minute/time.Second)
-}
 
 // failPattern matches failed test output like:
 // 19:53:03.590 FAIL: test_scheduler.go:221: SchedulerSuite.TestOmniJobs
@@ -405,9 +343,8 @@ func (r *Runner) build(b *Build) (err error) {
 			}
 		}
 
-		b.Duration = time.Since(start)
-		b.DurationFormatted = formatDuration(b.Duration)
-		fmt.Fprintf(mainLog, "build finished in %s\n", b.DurationFormatted)
+		b.Duration = time.Since(start).String()
+		fmt.Fprintf(mainLog, "build finished in %s\n", b.Duration)
 		if err != nil {
 			fmt.Fprintf(mainLog, "build error: %s\n", err)
 			fmt.Fprintln(mainLog, "DUMPING LOGS")
@@ -422,22 +359,17 @@ func (r *Runner) build(b *Build) (err error) {
 		if err == nil {
 			log.Printf("build %s passed!\n", b.ID)
 			r.updateStatus(b, "success")
-			r.postIRC("PASS: %s %s", b.Description, b.URL())
 		} else {
 			log.Printf("build %s failed: %s\n", b.ID, err)
 			r.updateStatus(b, "failure")
-			r.postIRC("FAIL: [%d failure(s)] %s %s", len(b.Failures), b.Description, b.URL())
 		}
 	}()
 
 	log.Printf("building %s\n", b.Commit)
 
 	out := &iotool.SafeWriter{W: io.MultiWriter(os.Stdout, mainLog, &failureBuf)}
-	bc := r.bc
-	bc.Network = r.allocateNet()
-	defer r.releaseNet(bc.Network)
 
-	c = cluster.New(bc, out)
+	c = cluster.New(r.bc, out)
 	log.Println("created cluster with ID", c.ID)
 	r.clusters[c.ID] = c
 	defer func() {
@@ -460,7 +392,14 @@ func (r *Runner) build(b *Build) (err error) {
 	}
 
 	var script bytes.Buffer
-	testRunScript.Execute(&script, map[string]interface{}{"Cluster": c, "Config": config.Clusters[0], "ListenPort": listenPort})
+	args := map[string]interface{}{
+		"RunnerIP": r.ip,
+		"Cluster":  c,
+		"Config":   config.Clusters[0],
+	}
+	if err := testRunScript.Execute(&script, args); err != nil {
+		return err
+	}
 	return c.RunWithEnv(script.String(), &cluster.Streams{Stdout: out, Stderr: out}, r.runEnv)
 }
 
@@ -474,7 +413,7 @@ func (r *Runner) uploadToS3(file *os.File, b *Build, boundary string) string {
 	name := fmt.Sprintf("%s-build-%s-%s.txt", b.ID, b.Commit, time.Now().Format("2006-01-02-15-04-05"))
 	url := fmt.Sprintf("https://s3.amazonaws.com/%s/%s", logBucket, name)
 
-	if _, err := file.Seek(0, os.SEEK_SET); err != nil {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		log.Printf("failed to seek log file: %s\n", err)
 		return ""
 	}
@@ -545,6 +484,29 @@ func (r *Runner) handleEvent(w http.ResponseWriter, req *http.Request, ps httpro
 	io.WriteString(w, "ok\n")
 }
 
+func scanBuild(s postgres.Scanner) (*Build, error) {
+	var build Build
+	if err := s.Scan(
+		&build.ID,
+		&build.Commit,
+		&build.Branch,
+		&build.Merge,
+		&build.State,
+		&build.Version,
+		&build.Failures,
+		&build.CreatedAt,
+		&build.Description,
+		&build.LogURL,
+		&build.LogFile,
+		&build.Duration,
+		&build.Reason,
+		&build.IssueLink,
+	); err != nil {
+		return nil, err
+	}
+	return &build, nil
+}
+
 func (r *Runner) getBuilds(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	w.Header().Set("Vary", "Accept")
 	if !strings.Contains(req.Header.Get("Accept"), "application/json") {
@@ -557,32 +519,29 @@ func (r *Runner) getBuilds(w http.ResponseWriter, req *http.Request, ps httprout
 		var err error
 		if count, err = strconv.Atoi(n); err != nil {
 			http.Error(w, "invalid count parameter\n", 400)
+			return
 		}
 	}
+
+	rows, err := r.db.Query("build_list", count)
+	if err != nil {
+		httphelper.Error(w, err)
+		return
+	}
+	defer rows.Close()
 	var builds []*Build
-
-	r.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(dbBucket).Cursor()
-
-		var k, v []byte
-		if before := req.FormValue("before"); before != "" {
-			c.Seek([]byte(before))
-			k, v = c.Prev()
-		} else {
-			k, v = c.Last()
+	for rows.Next() {
+		build, err := scanBuild(rows)
+		if err != nil {
+			httphelper.Error(w, err)
+			return
 		}
-
-		for i := 0; k != nil && i < count; k, v = c.Prev() {
-			b := &Build{}
-			if err := json.Unmarshal(v, b); err != nil {
-				log.Printf("could not decode build %s: %s", v, err)
-				continue
-			}
-			builds = append(builds, b)
-			i++
-		}
-		return nil
-	})
+		builds = append(builds, build)
+	}
+	if err := rows.Err(); err != nil {
+		httphelper.Error(w, err)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(builds)
@@ -673,21 +632,15 @@ func getBuildLogStream(b *Build, ch chan string) (stream.Stream, error) {
 
 func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	id := ps.ByName("build")
-	b := &Build{}
-	if err := r.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(dbBucket).Get([]byte(id))
-		if err := json.Unmarshal(v, b); err != nil {
-			return fmt.Errorf("could not decode build %s: %s", v, err)
-		}
-		return nil
-	}); err != nil {
-		http.Error(w, err.Error(), 500)
+	build, err := scanBuild(r.db.QueryRow("build_select", id))
+	if err != nil {
+		httphelper.Error(w, err)
 		return
 	}
 
 	// if it's a V1 build, redirect to the log in S3
-	if b.Version == BuildVersion1 {
-		http.Redirect(w, req, b.LogURL, http.StatusMovedPermanently)
+	if build.Version == BuildVersion1 {
+		http.Redirect(w, req, build.LogURL, http.StatusMovedPermanently)
 		return
 	}
 
@@ -699,7 +652,7 @@ func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httpro
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := tpl.Execute(w, b); err != nil {
+		if err := tpl.Execute(w, build); err != nil {
 			log.Printf("error executing build-log template: %s", err)
 		}
 		return
@@ -707,7 +660,7 @@ func (r *Runner) getBuildLog(w http.ResponseWriter, req *http.Request, ps httpro
 
 	// serve the build log as either an SSE or plain text stream
 	ch := make(chan string)
-	stream, err := getBuildLogStream(b, ch)
+	stream, err := getBuildLogStream(build, ch)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -752,19 +705,13 @@ func servePlainStream(w http.ResponseWriter, ch chan string) {
 
 func (r *Runner) downloadBuildLog(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	id := ps.ByName("build")
-	b := &Build{}
-	if err := r.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket(dbBucket).Get([]byte(id))
-		if err := json.Unmarshal(v, b); err != nil {
-			return fmt.Errorf("could not decode build %s: %s", v, err)
-		}
-		return nil
-	}); err != nil {
-		http.Error(w, err.Error(), 500)
+	build, err := scanBuild(r.db.QueryRow("build_select", id))
+	if err != nil {
+		httphelper.Error(w, err)
 		return
 	}
 
-	res, err := http.Get(b.LogURL)
+	res, err := http.Get(build.LogURL)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -787,7 +734,7 @@ func (r *Runner) downloadBuildLog(w http.ResponseWriter, req *http.Request, ps h
 	// part, but construct valid multipart content, headers included, so
 	// the file can be parsed with tools such as munpack(1).
 	w.Header().Set("Content-Type", textPlain)
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"flynn-ci-build-%s\"", path.Base(b.LogURL)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"flynn-ci-build-%s\"", path.Base(build.LogURL)))
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=%q\r\n\r\n", params["boundary"])
 	io.Copy(w, res.Body)
@@ -795,12 +742,9 @@ func (r *Runner) downloadBuildLog(w http.ResponseWriter, req *http.Request, ps h
 
 func (r *Runner) restartBuild(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	id := ps.ByName("build")
-	build := &Build{}
-	if err := r.db.View(func(tx *bolt.Tx) error {
-		val := tx.Bucket(dbBucket).Get([]byte(id))
-		return json.Unmarshal(val, build)
-	}); err != nil {
-		http.Error(w, fmt.Sprintf("could not decode build %s: %s\n", id, err), 400)
+	build, err := scanBuild(r.db.QueryRow("build_select", id))
+	if err != nil {
+		httphelper.Error(w, err)
 		return
 	}
 	if build.State != "pending" {
@@ -816,12 +760,9 @@ func (r *Runner) restartBuild(w http.ResponseWriter, req *http.Request, ps httpr
 
 func (r *Runner) explainBuild(w http.ResponseWriter, req *http.Request, ps httprouter.Params) {
 	id := ps.ByName("build")
-	build := &Build{}
-	if err := r.db.View(func(tx *bolt.Tx) error {
-		val := tx.Bucket(dbBucket).Get([]byte(id))
-		return json.Unmarshal(val, build)
-	}); err != nil {
-		http.Error(w, fmt.Sprintf("could not decode build %s: %s\n", id, err), 400)
+	build, err := scanBuild(r.db.QueryRow("build_select", id))
+	if err != nil {
+		httphelper.Error(w, err)
 		return
 	}
 	build.Reason = req.FormValue("reason")
@@ -844,7 +785,7 @@ func needsBuild(event Event) bool {
 	if e, ok := event.(*PushEvent); ok && (e.Deleted || e.Ref != "refs/heads/master") {
 		return false
 	}
-	return true
+	return !strings.Contains(strings.ToLower(event.String()), "[ci skip]")
 }
 
 type Status struct {
@@ -906,42 +847,23 @@ func (r *Runner) updateStatus(b *Build, state string) {
 	}()
 }
 
-func (r *Runner) allocateNet() string {
-	r.netMtx.Lock()
-	defer r.netMtx.Unlock()
-	for {
-		net := fmt.Sprintf("10.69.%d.1/24", r.subnet%256)
-		r.subnet++
-		if _, ok := r.networks[net]; !ok {
-			r.networks[net] = struct{}{}
-			return net
-		}
-	}
-}
-
-func (r *Runner) releaseNet(net string) {
-	r.netMtx.Lock()
-	defer r.netMtx.Unlock()
-	delete(r.networks, net)
-}
-
 func (r *Runner) buildPending() error {
+	rows, err := r.db.Query("build_pending")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
 	var pending []*Build
-
-	r.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(dbBucket).ForEach(func(k, v []byte) error {
-			b := &Build{}
-			if err := json.Unmarshal(v, b); err != nil {
-				log.Printf("could not decode build %s: %s", v, err)
-				return nil
-			}
-			if b.State == "pending" {
-				pending = append(pending, b)
-			}
-			return nil
-		})
-	})
-
+	for rows.Next() {
+		build, err := scanBuild(rows)
+		if err != nil {
+			return err
+		}
+		pending = append(pending, build)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	for _, b := range pending {
 		go r.build(b)
 	}
@@ -949,13 +871,22 @@ func (r *Runner) buildPending() error {
 }
 
 func (r *Runner) save(b *Build) error {
-	return r.db.Update(func(tx *bolt.Tx) error {
-		val, err := json.Marshal(b)
-		if err != nil {
-			return err
-		}
-		return tx.Bucket(dbBucket).Put([]byte(b.ID), val)
-	})
+	return r.db.Exec("build_insert",
+		b.ID,
+		b.Commit,
+		b.Branch,
+		b.Merge,
+		b.State,
+		b.Version,
+		b.Failures,
+		b.CreatedAt,
+		b.Description,
+		b.LogURL,
+		b.LogFile,
+		b.Duration,
+		b.Reason,
+		b.IssueLink,
+	)
 }
 
 type clusterHandle func(*cluster.Cluster, http.ResponseWriter, url.Values, httprouter.Params) error

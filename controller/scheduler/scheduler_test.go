@@ -15,7 +15,7 @@ import (
 	"github.com/flynn/flynn/pkg/random"
 	"github.com/flynn/flynn/pkg/typeconv"
 	. "github.com/flynn/go-check"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 func Test(t *testing.T) { TestingT(t) }
@@ -238,8 +238,6 @@ func (TestSuite) TestFormationChange(c *C) {
 	c.Assert(err, IsNil)
 	release, err := s.GetRelease(testReleaseID)
 	c.Assert(err, IsNil)
-	artifact, err := s.GetArtifact(release.ArtifactIDs[0])
-	c.Assert(err, IsNil)
 
 	// Test scaling up an existing formation
 	c.Log("Test scaling up an existing formation. Wait for formation change and job start")
@@ -262,7 +260,7 @@ func (TestSuite) TestFormationChange(c *C) {
 
 	// Test creating a new formation
 	c.Log("Test creating a new formation. Wait for formation change and job start")
-	artifact = &ct.Artifact{ID: random.UUID()}
+	artifact := &ct.Artifact{ID: random.UUID()}
 	processes := map[string]int{testJobType: testJobCount}
 	release = NewRelease(random.UUID(), artifact, processes)
 	s.CreateArtifact(artifact)
@@ -463,6 +461,7 @@ func (TestSuite) TestMultipleHosts(c *C) {
 	// move host2's job to host3
 	var job *host.ActiveJob
 	jobs, err := host2.ListJobs()
+	c.Assert(err, IsNil)
 	for _, j := range jobs {
 		if j.Status == host.StatusStarting {
 			job = &j

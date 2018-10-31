@@ -19,7 +19,7 @@ import (
 	"github.com/flynn/flynn/pkg/stream"
 	"github.com/flynn/flynn/pkg/syslog/rfc5424"
 	"github.com/flynn/flynn/pkg/syslog/rfc6587"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -105,7 +105,7 @@ func (m *Mux) broadcast(app string, msg message) {
 }
 
 func (m *Mux) addSink(sink Sink) {
-	l := m.logger.New("fn", "addSink")
+	l := m.logger.New("fn", "addSink", "name", sink.Name())
 	shutdownCh := sink.ShutdownCh()
 	reconnectDelay := 0 * time.Second
 
@@ -123,6 +123,7 @@ func (m *Mux) addSink(sink Sink) {
 					reconnectDelay = 10 * time.Second
 					return
 				}
+				l.Info("connected to sink")
 				sinkCursor, err := sink.GetCursor(m.hostID)
 				if err != nil {
 					l.Error("failed to get cursor from sink")

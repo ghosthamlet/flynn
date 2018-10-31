@@ -8,12 +8,15 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"sync"
 	"time"
 
 	"github.com/flynn/flynn/pkg/random"
+	router "github.com/flynn/flynn/router/types"
+	"github.com/inconshreveable/log15"
 	"golang.org/x/crypto/nacl/secretbox"
 	"golang.org/x/net/context"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 type backendDialer interface {
@@ -39,8 +42,8 @@ var (
 	}
 )
 
-// BackendListFunc returns a slice of backend hosts (hostname:port).
-type BackendListFunc func() []string
+// BackendListFunc returns a slice of backends
+type BackendListFunc func() []*router.Backend
 
 type transport struct {
 	getBackends BackendListFunc
@@ -49,9 +52,9 @@ type transport struct {
 	useStickySessions bool
 }
 
-func (t *transport) getOrderedBackends(stickyBackend string) []string {
+func (t *transport) getOrderedBackends(stickyBackend string) []*router.Backend {
 	backends := t.getBackends()
-	shuffle(backends)
+	shuffleBackends(backends)
 
 	if stickyBackend != "" {
 		swapToFront(backends, stickyBackend)
@@ -75,7 +78,7 @@ func (t *transport) setStickyBackend(res *http.Response, originalStickyBackend s
 	}
 }
 
-func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Logger) (*http.Response, string, error) {
+func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Logger) (*http.Response, *RequestTrace, error) {
 	// http.Transport closes the request body on a failed dial, issue #875
 	req.Body = &fakeCloseReadCloser{req.Body}
 	defer req.Body.(*fakeCloseReadCloser).RealClose()
@@ -83,33 +86,38 @@ func (t *transport) RoundTrip(ctx context.Context, req *http.Request, l log15.Lo
 	// hook up CloseNotify to cancel the request
 	req.Cancel = ctx.Done()
 
+	// trace the request timings (do not use the trace before the request
+	// has been RoundTripped)
+	req, trace := traceRequest(req)
+
 	rt := ctx.Value(ctxKeyRequestTracker).(RequestTracker)
 	stickyBackend := t.getStickyBackend(req)
 	backends := t.getOrderedBackends(stickyBackend)
 	for i, backend := range backends {
-		req.URL.Host = backend
-		rt.TrackRequestStart(backend)
+		req.URL.Host = backend.Addr
+		rt.TrackRequestStart(backend.Addr)
 		res, err := httpTransport.RoundTrip(req)
 		if err == nil {
+			trace.Finalize(backend)
 			t.setStickyBackend(res, stickyBackend)
-			return res, backend, nil
+			return res, trace, nil
 		}
-		rt.TrackRequestDone(backend)
+		rt.TrackRequestDone(backend.Addr)
 		if _, ok := err.(dialErr); !ok {
-			l.Error("unretriable request error", "backend", backend, "err", err, "attempt", i)
-			return nil, "", err
+			l.Error("unretriable request error", "status", "503", "job.id", backend.JobID, "addr", backend.Addr, "err", err, "attempt", i)
+			return nil, nil, err
 		}
-		l.Error("retriable dial error", "backend", backend, "err", err, "attempt", i)
+		l.Error("retriable dial error", "job.id", backend.JobID, "addr", backend.Addr, "err", err, "attempt", i)
 	}
 	l.Error("request failed", "status", "503", "num_backends", len(backends))
-	return nil, "", errNoBackends
+	return nil, nil, errNoBackends
 }
 
 func (t *transport) Connect(ctx context.Context, l log15.Logger) (net.Conn, error) {
 	backends := t.getOrderedBackends("")
-	conn, _, err := dialTCP(ctx, l, backends)
+	conn, backend, err := dialTCP(ctx, l, backends)
 	if err != nil {
-		l.Error("connection failed", "num_backends", len(backends))
+		l.Error("connection failed", "err", err, "num_backends", len(backends), "job.id", backend.JobID, "addr", backend.Addr)
 	}
 	return conn, err
 }
@@ -117,44 +125,44 @@ func (t *transport) Connect(ctx context.Context, l log15.Logger) (net.Conn, erro
 func (t *transport) UpgradeHTTP(req *http.Request, l log15.Logger) (*http.Response, net.Conn, error) {
 	stickyBackend := t.getStickyBackend(req)
 	backends := t.getOrderedBackends(stickyBackend)
-	upconn, addr, err := dialTCP(context.Background(), l, backends)
+	upconn, backend, err := dialTCP(context.Background(), l, backends)
 	if err != nil {
 		l.Error("dial failed", "status", "503", "num_backends", len(backends))
 		return nil, nil, err
 	}
 	conn := &streamConn{bufio.NewReader(upconn), upconn}
-	req.URL.Host = addr
+	req.URL.Host = backend.Addr
 
 	if err := req.Write(conn); err != nil {
 		conn.Close()
-		l.Error("error writing request", "err", err, "backend", addr)
+		l.Error("error writing request", "err", err, "job.id", backend.JobID, "addr", backend.Addr)
 		return nil, nil, err
 	}
 	res, err := http.ReadResponse(conn.Reader, req)
 	if err != nil {
 		conn.Close()
-		l.Error("error reading response", "err", err, "backend", addr)
+		l.Error("error reading response", "err", err, "job.id", backend.JobID, "addr", backend.Addr)
 		return nil, nil, err
 	}
 	t.setStickyBackend(res, stickyBackend)
 	return res, conn, nil
 }
 
-func dialTCP(ctx context.Context, l log15.Logger, addrs []string) (net.Conn, string, error) {
+func dialTCP(ctx context.Context, l log15.Logger, backends []*router.Backend) (net.Conn, *router.Backend, error) {
 	donec := ctx.Done()
-	for i, addr := range addrs {
+	for i, backend := range backends {
 		select {
 		case <-donec:
-			return nil, "", errCanceled
+			return nil, nil, errCanceled
 		default:
 		}
-		conn, err := dialer.Dial("tcp", addr)
+		conn, err := dialer.Dial("tcp", backend.Addr)
 		if err == nil {
-			return conn, addr, nil
+			return conn, backend, nil
 		}
-		l.Error("retriable dial error", "backend", addr, "err", err, "attempt", i)
+		l.Error("retriable dial error", "job.id", backend.JobID, "addr", backend.Addr, "err", err, "attempt", i)
 	}
-	return nil, "", errNoBackends
+	return nil, nil, errNoBackends
 }
 
 func customDial(network, addr string) (net.Conn, error) {
@@ -184,17 +192,17 @@ func (w *fakeCloseReadCloser) RealClose() error {
 	return w.ReadCloser.Close()
 }
 
-func shuffle(s []string) {
-	for i := len(s) - 1; i > 0; i-- {
+func shuffleBackends(backends []*router.Backend) {
+	for i := len(backends) - 1; i > 0; i-- {
 		j := random.Math.Intn(i + 1)
-		s[i], s[j] = s[j], s[i]
+		backends[i], backends[j] = backends[j], backends[i]
 	}
 }
 
-func swapToFront(ss []string, s string) {
-	for i := range ss {
-		if ss[i] == s {
-			ss[0], ss[i] = ss[i], ss[0]
+func swapToFront(backends []*router.Backend, addr string) {
+	for i, backend := range backends {
+		if backend.Addr == addr {
+			backends[0], backends[i] = backends[i], backends[0]
 			return
 		}
 	}
@@ -245,4 +253,77 @@ func decrypt(data []byte, key [32]byte) []byte {
 		return nil
 	}
 	return res
+}
+
+type RequestTrace struct {
+	Backend        *router.Backend
+	mtx            sync.Mutex
+	final          bool
+	ReusedConn     bool
+	WasIdleConn    bool
+	ConnectStart   time.Time
+	ConnectDone    time.Time
+	HeadersWritten time.Time
+	BodyWritten    time.Time
+	FirstByte      time.Time
+}
+
+// Finalize safely finalizes the trace for read access.
+func (r *RequestTrace) Finalize(backend *router.Backend) {
+	r.mtx.Lock()
+	r.final = true
+	r.Backend = backend
+	r.mtx.Unlock()
+}
+
+// traceRequest sets up request tracing and returns the modified
+// request.
+func traceRequest(req *http.Request) (*http.Request, *RequestTrace) {
+	trace := &RequestTrace{}
+	ct := &httptrace.ClientTrace{
+		GetConn: func(hostPort string) {
+			trace.mtx.Lock()
+			defer trace.mtx.Unlock()
+			if trace.final {
+				return
+			}
+			trace.ConnectStart = time.Now()
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			trace.mtx.Lock()
+			defer trace.mtx.Unlock()
+			if trace.final {
+				return
+			}
+			trace.ConnectDone = time.Now()
+			trace.ReusedConn = info.Reused
+			trace.WasIdleConn = info.WasIdle
+		},
+		WroteHeaders: func() {
+			trace.mtx.Lock()
+			defer trace.mtx.Unlock()
+			if trace.final {
+				return
+			}
+			trace.HeadersWritten = time.Now()
+		},
+		WroteRequest: func(info httptrace.WroteRequestInfo) {
+			trace.mtx.Lock()
+			defer trace.mtx.Unlock()
+			if trace.final {
+				return
+			}
+			trace.BodyWritten = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			trace.mtx.Lock()
+			defer trace.mtx.Unlock()
+			if trace.final {
+				return
+			}
+			trace.FirstByte = time.Now()
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), ct))
+	return req, trace
 }

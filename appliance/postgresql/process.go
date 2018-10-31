@@ -21,8 +21,8 @@ import (
 	"github.com/flynn/flynn/pkg/sirenia/client"
 	"github.com/flynn/flynn/pkg/sirenia/state"
 	"github.com/flynn/flynn/pkg/sirenia/xlog"
+	"github.com/inconshreveable/log15"
 	"github.com/jackc/pgx"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -39,6 +39,7 @@ type Config struct {
 	OpTimeout    time.Duration
 	ReplTimeout  time.Duration
 	Logger       log15.Logger
+	TimescaleDB  bool
 	ExtWhitelist bool
 	SHMType      string
 	WaitUpstream bool
@@ -66,6 +67,7 @@ type Process struct {
 	password     string
 	opTimeout    time.Duration
 	replTimeout  time.Duration
+	timescaleDB  bool
 	extWhitelist bool
 	shmType      string
 	waitUpstream bool
@@ -98,6 +100,7 @@ func NewProcess(c Config) *Process {
 		password:       c.Password,
 		opTimeout:      c.OpTimeout,
 		replTimeout:    c.ReplTimeout,
+		timescaleDB:    c.TimescaleDB,
 		extWhitelist:   c.ExtWhitelist,
 		shmType:        c.SHMType,
 		waitUpstream:   c.WaitUpstream,
@@ -114,7 +117,7 @@ func NewProcess(c Config) *Process {
 		p.port = "5432"
 	}
 	if p.binDir == "" {
-		p.binDir = "/usr/lib/postgresql/9.5/bin/"
+		p.binDir = "/usr/lib/postgresql/10/bin/"
 	}
 	if p.dataDir == "" {
 		p.dataDir = "/data"
@@ -244,9 +247,9 @@ func (p *Process) XLogPosition() (xlog.Position, error) {
 		return "", errors.New("postgres is not running")
 	}
 
-	fn := "pg_last_xlog_replay_location()"
+	fn := "pg_last_wal_replay_lsn()"
 	if p.config().Role == state.RolePrimary {
-		fn = "pg_current_xlog_location()"
+		fn = "pg_current_wal_lsn()"
 	}
 	var res string
 	err := p.db.QueryRow("SELECT " + fn).Scan(&res)
@@ -460,7 +463,7 @@ func (p *Process) assumeStandby(upstream, downstream *discoverd.Instance) error 
 				"host=%s port=%s user=flynn password=%s application_name=%s",
 				upstream.Host(), upstream.Port(), p.password, upstream.Meta[IDKey],
 			),
-			"--xlog-method=stream",
+			"--wal-method=stream",
 			"--progress",
 			"--verbose",
 		))
@@ -781,7 +784,7 @@ func (p *Process) checkReplStatus(name string) (sent, flushed xlog.Position, err
 
 	var s, f pgx.NullString
 	err = p.db.QueryRow(`
-SELECT sent_location, flush_location
+SELECT sent_lsn, flush_lsn
 FROM pg_stat_replication
 WHERE application_name = $1`, name).Scan(&s, &f)
 	if err != nil && err != pgx.ErrNoRows {
@@ -829,6 +832,7 @@ func (p *Process) runCmd(cmd *exec.Cmd) error {
 func (p *Process) writeConfig(d configData) error {
 	d.ID = p.id
 	d.Port = p.port
+	d.TimescaleDB = p.timescaleDB
 	d.ExtWhitelist = p.extWhitelist
 	d.SHMType = p.shmType
 	f, err := os.Create(p.configPath())
@@ -890,6 +894,7 @@ type configData struct {
 	Sync     string
 	ReadOnly bool
 
+	TimescaleDB  bool
 	ExtWhitelist bool
 	SHMType      string
 }
@@ -927,13 +932,17 @@ timezone = 'UTC'
 client_encoding = 'UTF8'
 default_text_search_config = 'pg_catalog.english'
 
+{{if .TimescaleDB}}
+shared_preload_libraries = 'timescaledb'
+{{end}}
+
 {{if .SHMType}}
 dynamic_shared_memory_type = '{{.SHMType}}'
 {{end}}
 
 {{if .ExtWhitelist}}
 local_preload_libraries = 'pgextwlist'
-extwlist.extensions = 'btree_gin,btree_gist,chkpass,citext,cube,dblink,dict_int,earthdistance,fuzzystrmatch,hstore,intarray,isn,ltree,pg_prewarm,pg_stat_statements,pg_trgm,pgcrypto,pgrouting,pgrowlocks,pgstattuple,plpgsql,plv8,postgis,postgis_topology,postgres_fdw,tablefunc,unaccent,uuid-ossp'
+extwlist.extensions = 'btree_gin,btree_gist,chkpass,citext,cube,dblink,dict_int,earthdistance,fuzzystrmatch,hstore,intarray,isn,ltree,pg_prewarm,pg_stat_statements,pg_trgm,pgcrypto,pgrouting,pgrowlocks,pgstattuple,plpgsql,plv8,postgis,postgis_topology,postgres_fdw,tablefunc,timescaledb,unaccent,uuid-ossp'
 {{end}}
 `[1:]))
 

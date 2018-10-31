@@ -56,6 +56,17 @@
       }]
     },
     {
+      "id": "build-tools",
+      "base": "busybox",
+      "layers": [{
+        "gobuild": {
+          "vendor/github.com/golang/dep/cmd/dep": "/bin/dep",
+          "vendor/github.com/flynn/go-tuf/cmd/tuf": "/bin/tuf",
+          "vendor/github.com/flynn/go-tuf/cmd/tuf-client": "/bin/tuf-client"
+        }
+      }]
+    },
+    {
       "id": "discoverd",
       "base": "busybox",
       "layers": [{
@@ -301,6 +312,9 @@
       "layers": [{
         "gobuild": {
           "router": "/bin/flynn-router"
+        },
+        "copy": {
+          "util/ca-certs/ca-certs.pem": "/etc/ssl/certs/ca-certs.pem"
         }
       }],
       "entrypoint": {
@@ -422,7 +436,8 @@
           "inputs": [
             "slugbuilder/builder/buildpacks.txt",
             "slugbuilder/builder/install-buildpack"
-          ]
+          ],
+          "limits": { "temp_disk": "1G" }
         },
         {
           "name": "slugbuilder-binaries",
@@ -464,7 +479,8 @@
         "script": "util/assetbuilder/build.sh",
         "env": {"TARGET": "dashboard"},
         "gobuild": {
-          "dashboard/app": "/bin/dashboard-compile"
+          "dashboard/app": "/bin/dashboard-compile",
+          "vendor/github.com/jteeuwen/go-bindata/go-bindata": "/bin/go-bindata"
         },
         "inputs": [
           "dashboard/app/Gemfile",
@@ -502,7 +518,7 @@
           "dashboard/app/vendor/javascripts/*.js",
           "dashboard/app/vendor/stylesheets/*.scss"
         ],
-        "limits": { "memory": "2G", "temp_disk": "1G" }
+        "limits": { "memory": "3G", "temp_disk": "1G" }
       }]
     },
     {
@@ -603,7 +619,8 @@
       "layers": [
         {
           "name": "test-packages",
-          "script": "test/img/packages.sh"
+          "script": "test/img/packages.sh",
+          "limits": { "temp_disk": "1G" }
         },
         {
           "name": "test-binaries",
@@ -615,7 +632,17 @@
             "test/util/file-server": "/bin/flynn-test-file-server"
           },
           "copy": {
-            "test/run.sh": "/bin/run-flynn-test.sh"
+            "test/run.sh":           "/bin/run-flynn-test.sh",
+            "test/vm.sh":            "/bin/run-vm.sh",
+            "test/scripts/start.sh": "/test/bin/start-runner.sh",
+            "test/rootfs/build.sh":  "/test/rootfs/build.sh",
+            "test/rootfs/setup.sh":  "/test/rootfs/setup.sh",
+            "test/runner/assets/build-log.html": "/test/assets/",
+            "test/runner/assets/build-log.js":   "/test/assets/",
+            "test/runner/assets/builds.js":      "/test/assets/",
+            "test/runner/assets/index.html":     "/test/assets/",
+            "test/runner/assets/style.css":      "/test/assets/",
+            "test/runner/assets/ansi_up/ansi_up.js": "/test/assets/ansi_up/"
           }
         }
       ],

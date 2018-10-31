@@ -1195,6 +1195,7 @@ func (s *S) TestUpgradeHeaderIsCaseInsensitive(c *C) {
 		req.Header.Set("Connection", value)
 		req.Header.Set("Upgrade", "Some-proto-2")
 		res, err := httpClient.Do(req)
+		c.Assert(err, IsNil)
 		defer res.Body.Close()
 
 		c.Assert(err, IsNil)
@@ -1298,6 +1299,7 @@ func (s *S) TestStickyHTTPRouteWebsocket(c *C) {
 			req.Header.Set("Connection", "Upgrade")
 			req.Header.Set("Upgrade", "websocket")
 			res, err := httpClient.Do(req)
+			c.Assert(err, IsNil)
 			defer res.Body.Close()
 
 			c.Assert(err, IsNil)
@@ -1711,7 +1713,7 @@ func (s *S) TestHTTPHijackUpgrade(c *C) {
 		rw.Header().Set("Upgrade", "pinger")
 		rw.WriteHeader(101)
 
-		conn, bufrw, err := rw.(http.Hijacker).Hijack()
+		conn, bufrw, _ := rw.(http.Hijacker).Hijack()
 		defer conn.Close()
 
 		line, _, err := bufrw.ReadLine()
@@ -1845,4 +1847,27 @@ func (s *S) TestHTTPProxyProtocol(c *C) {
 		data, _ := ioutil.ReadAll(res.Body)
 		c.Assert(string(data), Equals, "1.1.1.123")
 	}
+}
+
+func (s *S) TestLegacyTLSDisallowed(c *C) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {})
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	l := s.newHTTPListener(c)
+	defer l.Close()
+
+	addHTTPRoute(c, l)
+
+	discoverdRegisterHTTP(c, l, srv.Listener.Addr().String())
+
+	config := newHTTPClient("example.com").Transport.(*http.Transport).TLSClientConfig
+	config.MaxVersion = tls.VersionTLS10
+	conn, err := net.Dial("tcp", l.TLSAddrs[0])
+	c.Assert(err, IsNil)
+	defer conn.Close()
+	client := tls.Client(conn, config)
+	err = client.Handshake()
+	c.Assert(err, Not(IsNil))
+	c.Assert(err, ErrorMatches, ".+protocol version not supported")
 }

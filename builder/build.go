@@ -36,7 +36,7 @@ import (
 	tufdata "github.com/flynn/go-tuf/data"
 	"github.com/golang/groupcache/singleflight"
 	"github.com/tent/canonical-json-go"
-	"gopkg.in/inconshreveable/log15.v2"
+	"github.com/inconshreveable/log15"
 )
 
 var cmdBuild = Command{
@@ -1176,6 +1176,7 @@ func (g *GoInputs) load(pkg string) ([]string, error) {
 		files := p.GoFiles
 		files = append(files, p.CgoFiles...)
 		files = append(files, p.CFiles...)
+		files = append(files, p.HFiles...)
 		files = append(files, p.SFiles...)
 		files = append(files, p.IgnoredGoFiles...)
 

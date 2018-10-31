@@ -25,11 +25,14 @@ usage: flynn-host run [options] [--] <artifact> <command> [<argument>...]
 Run an interactive job.
 
 Options:
-	--host=<host>        run on a specific host
-	--bind=<mountspecs>  bind mount a directory into the job (ex: /foo:/data,/bar:/baz)
-	--volume=<path>      mount a temporary volume at <path>
-	--limits=<limits>    resource limits (ex: memory=2G,temp_disk=200MB)
-	--workdir=<dir>      working directory
+	--host=<host>          run on a specific host
+	--bind=<mountspecs>    bind mount a directory into the job (ex: /foo:/data,/bar:/baz)
+	--volume=<path>        mount a temporary volume at <path>
+	--limits=<limits>      resource limits (ex: memory=2G,temp_disk=200MB)
+	--workdir=<dir>        working directory
+	--hostnet              use the host network
+	--profiles=<profiles>  job profiles (comma separated)
+	--extra-caps=<caps>    extra Linux capabilities (comma separated)
 
 Example:
 	$ flynn-host run <(jq '.mongodb' images.json) mongo --version
@@ -46,11 +49,12 @@ func runRun(args *docopt.Args, client *cluster.Client) error {
 		ImageArtifact: artifact,
 		Job: &host.Job{
 			Config: host.ContainerConfig{
-				Args:       append([]string{args.String["<command>"]}, args.All["<argument>"].([]string)...),
-				TTY:        term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()),
-				Stdin:      true,
-				DisableLog: true,
-				WorkingDir: args.String["--workdir"],
+				Args:        append([]string{args.String["<command>"]}, args.All["<argument>"].([]string)...),
+				TTY:         term.IsTerminal(os.Stdin.Fd()) && term.IsTerminal(os.Stdout.Fd()),
+				Stdin:       true,
+				DisableLog:  true,
+				WorkingDir:  args.String["--workdir"],
+				HostNetwork: args.Bool["--hostnet"],
 			},
 		},
 		Stdin:  os.Stdin,
@@ -104,6 +108,17 @@ func runRun(args *docopt.Args, client *cluster.Client) error {
 		for typ, limit := range resources {
 			cmd.Job.Resources[typ] = limit
 		}
+	}
+	if profiles := args.String["--profiles"]; profiles != "" {
+		s := strings.Split(profiles, ",")
+		cmd.Job.Profiles = make([]host.JobProfile, len(s))
+		for i, profile := range s {
+			cmd.Job.Profiles[i] = host.JobProfile(profile)
+		}
+	}
+	if extraCaps := args.String["--extra-caps"]; extraCaps != "" {
+		linuxCapabilities := append(host.DefaultCapabilities, strings.Split(extraCaps, ",")...)
+		cmd.Job.Config.LinuxCapabilities = &linuxCapabilities
 	}
 
 	var termState *term.State

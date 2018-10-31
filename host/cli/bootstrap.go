@@ -145,7 +145,7 @@ func runBootstrapBackup(manifest []byte, backupFile string, ch chan *bootstrap.S
 		for {
 			header, err := tr.Next()
 			if err == io.EOF && !rewound {
-				if _, err := f.Seek(0, os.SEEK_SET); err != nil {
+				if _, err := f.Seek(0, io.SeekStart); err != nil {
 					return nil, fmt.Errorf("error seeking in backup file: %s", err)
 				}
 				rewound = true
@@ -515,6 +515,9 @@ WHERE release_id = (SELECT release_id FROM apps WHERE name = 'dashboard' AND del
 			ExpandedFormation: data.Controller,
 		}),
 	}.RunWithState(ch, state)
+	if err != nil {
+		return err
+	}
 
 	// wait for controller to come up
 	meta = bootstrap.StepMeta{ID: "wait-controller", Action: "wait-controller"}

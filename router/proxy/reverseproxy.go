@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/inconshreveable/log15"
 	"golang.org/x/net/context"
-	"gopkg.in/inconshreveable/log15.v2"
 )
 
 const (
@@ -56,6 +56,8 @@ type ReverseProxy struct {
 
 	// Logger is the logger for the proxy.
 	Logger log15.Logger
+
+	Error503Page []byte
 }
 
 type RequestTracker interface {
@@ -127,17 +129,33 @@ func (p *ReverseProxy) ServeHTTP(ctx context.Context, rw http.ResponseWriter, re
 		}()
 	}
 
-	res, backend, err := transport.RoundTrip(ctx, outreq, l)
+	res, trace, err := transport.RoundTrip(ctx, outreq, l)
 	if err != nil {
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		rw.Write(serviceUnavailable)
+		p.serviceUnavailable(rw)
 		return
 	}
 	defer res.Body.Close()
-	defer p.RequestTracker.TrackRequestDone(backend)
+	defer p.RequestTracker.TrackRequestDone(trace.Backend.Addr)
 
 	prepareResponseHeaders(res)
 	p.writeResponse(rw, res)
+	if location := res.Header.Get("Location"); location != "" {
+		l = l.New("location", location)
+	}
+	if !trace.ReusedConn {
+		l = l.New("connect", trace.ConnectDone.Sub(trace.ConnectStart))
+	}
+	if req.Body != nil {
+		l = l.New("write_req_body", trace.BodyWritten.Sub(trace.HeadersWritten))
+	}
+	l.Debug("request complete",
+		"status", res.StatusCode,
+		"job.id", trace.Backend.JobID,
+		"addr", trace.Backend.Addr,
+		"conn_reused", trace.ReusedConn,
+		"write_req_headers", trace.HeadersWritten.Sub(trace.ConnectDone),
+		"read_res_first_byte", trace.FirstByte.Sub(trace.HeadersWritten),
+	)
 }
 
 // ServeConn takes an inbound conn and proxies it to a backend.
@@ -179,8 +197,7 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 
 	res, uconn, err := transport.UpgradeHTTP(req, l)
 	if err != nil {
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		rw.Write(serviceUnavailable)
+		p.serviceUnavailable(rw)
 		return
 	}
 	defer uconn.Close()
@@ -195,8 +212,7 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 	dconn, bufrw, err := rw.(http.Hijacker).Hijack()
 	if err != nil {
 		l.Error("error hijacking request", "err", err, "status", "503")
-		rw.WriteHeader(http.StatusServiceUnavailable)
-		rw.Write(serviceUnavailable)
+		p.serviceUnavailable(rw)
 		return
 	}
 	defer dconn.Close()
@@ -206,6 +222,18 @@ func (p *ReverseProxy) serveUpgrade(rw http.ResponseWriter, l log15.Logger, req 
 		return
 	}
 	joinConns(uconn, &streamConn{bufrw.Reader, dconn})
+}
+
+func (p *ReverseProxy) serviceUnavailable(rw http.ResponseWriter) {
+	if len(p.Error503Page) > 0 {
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		rw.WriteHeader(http.StatusServiceUnavailable)
+		rw.Write(p.Error503Page)
+		return
+	}
+	rw.WriteHeader(http.StatusServiceUnavailable)
+	rw.Write(serviceUnavailable)
+	return
 }
 
 func prepareResponseHeaders(res *http.Response) {

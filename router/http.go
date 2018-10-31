@@ -34,6 +34,8 @@ type HTTPListener struct {
 	Addrs    []string
 	TLSAddrs []string
 
+	LegacyTLSVersions bool
+
 	defaultPorts []int
 
 	mtx      sync.RWMutex
@@ -52,6 +54,8 @@ type HTTPListener struct {
 	cookieKey     *[32]byte
 	keypair       tls.Certificate
 	proxyProtocol bool
+
+	error503Page []byte
 
 	preSync  func()
 	postSync func(<-chan struct{})
@@ -339,11 +343,12 @@ func (h *httpSyncHandler) Set(data *router.Route) error {
 	service.refs++
 	var bf proxy.BackendListFunc
 	if r.Leader {
-		bf = service.sc.LeaderAddr
+		bf = backendFunc(r.Service, service.sc.Leader)
 	} else {
-		bf = service.sc.Addrs
+		bf = backendFunc(r.Service, service.sc.Instances)
 	}
-	r.rp = proxy.NewReverseProxy(bf, h.l.cookieKey, r.Sticky, service, logger)
+	r.rp = proxy.NewReverseProxy(bf, h.l.cookieKey, r.Sticky, service, logger.New("service", r.Service))
+	r.rp.Error503Page = h.l.error503Page
 	r.service = service
 	h.l.routes[data.ID] = r
 	domain := net.JoinHostPort(strings.ToLower(r.Domain), strconv.Itoa(r.Port))
@@ -446,6 +451,11 @@ func (s *HTTPListener) listenAndServeTLS() error {
 			Certificates:   []tls.Certificate{s.keypair},
 			NextProtos:     []string{http2.NextProtoTLS, "h2-14"},
 		})
+		if s.LegacyTLSVersions {
+			tlsConfig.MinVersion = tls.VersionTLS10
+		} else {
+			tlsConfig.MinVersion = tls.VersionTLS12
+		}
 
 		l, err := listenFunc("tcp4", addr)
 		if err != nil {
@@ -620,6 +630,7 @@ func (s *service) handleBackendEvent(event *discoverd.Event) {
 	backend := &router.Backend{
 		Service: s.name,
 		Addr:    event.Instance.Addr,
+		App:     event.Instance.Meta["FLYNN_APP_NAME"],
 		JobID:   event.Instance.Meta["FLYNN_JOB_ID"],
 	}
 	switch event.Kind {
@@ -670,5 +681,21 @@ func setRequestID(req *http.Request) {
 	clientHeader := req.Header.Get("X-Request-Id")
 	if clientHeader == "" || len(clientHeader) < 20 || len(clientHeader) > 200 || !validRequestIDPattern.MatchString(clientHeader) {
 		req.Header.Set("X-Request-Id", random.UUID())
+	}
+}
+
+func backendFunc(service string, f func() []*discoverd.Instance) proxy.BackendListFunc {
+	return func() []*router.Backend {
+		instances := f()
+		backends := make([]*router.Backend, len(instances))
+		for i, inst := range instances {
+			backends[i] = &router.Backend{
+				Service: service,
+				Addr:    inst.Addr,
+				App:     inst.Meta["FLYNN_APP_NAME"],
+				JobID:   inst.Meta["FLYNN_JOB_ID"],
+			}
+		}
+		return backends
 	}
 }

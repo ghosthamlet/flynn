@@ -110,6 +110,7 @@ type ProcessType struct {
 	Resurrect         bool               `json:"resurrect,omitempty"`
 	Resources         resource.Resources `json:"resources,omitempty"`
 	Mounts            []host.Mount       `json:"mounts,omitempty"`
+	Profiles          []host.JobProfile  `json:"profiles,omitempty"`
 	LinuxCapabilities []string           `json:"linux_capabilities,omitempty"`
 	AllowedDevices    []*configs.Device  `json:"allowed_devices,omitempty"`
 	WriteableCgroups  bool               `json:"writeable_cgroups,omitempty"`
@@ -340,6 +341,7 @@ type NewJob struct {
 	Resources   resource.Resources `json:"resources,omitempty"`
 	Data        bool               `json:"data,omitempty"`
 	Partition   PartitionType      `json:"partition,omitempty"`
+	Profiles    []host.JobProfile  `json:"profiles,omitempty"`
 
 	// MountsFrom is a process type to copy mounts from
 	MountsFrom string `json:"mounts_from,omitempty"`

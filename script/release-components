@@ -13,9 +13,6 @@
 # - Configure s3cmd
 #   s3cmd --configure
 #
-# - Install go-tuf
-#   go get github.com/flynn/go-tuf/cmd/tuf
-#
 # - Set the TUF passphrases
 #   export TUF_TARGETS_PASSPHRASE=xxxxxx
 #   export TUF_SNAPSHOT_PASSPHRASE=xxxxxx
@@ -121,13 +118,6 @@ main() {
   fi
 
   pushd "${src}" >/dev/null
-
-  info "pulling dependent images"
-  git grep -h "^FROM" **/Dockerfile \
-    | cut -d " " -f 2 \
-    | sort \
-    | uniq \
-    | xargs -L 1 docker pull
 
   info "building flynn"
   git checkout --force --quiet "${commit}"
